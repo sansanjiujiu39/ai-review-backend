@@ -14,13 +14,35 @@ DeepSeek API Key 只存在于本服务环境变量中，绝不进入前端代码
 
 import os
 import re
+import io
 import json
 import logging
+from datetime import date
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+
+# python-docx（Word 报告导出）
+try:
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+    Document = None
+
+
+def _to_rgb(color):
+    """兼容 int(0xRRGGBB) 与 RGBColor 两种传参"""
+    if isinstance(color, int):
+        return RGBColor((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+    return color
 
 # ─────────────────────────── 配置 ───────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -277,6 +299,148 @@ async def review(req: ReviewRequest):
         result["total"] = 0
 
     return {"ok": True, "track": req.track, "material": req.material, "result": result}
+
+
+# ─────────────────────────── Word 报告导出（明鉴专业商业报告格式） ───────────────────────────
+class ExportRequest(BaseModel):
+    title: str = Field("创新作品", description="作品名称（用于报告封面与文件名）")
+    track: str = Field("", description="赛道展示名，如 高教主赛道 · 创意组")
+    material: str = Field("bp", description="bp | ppt")
+    result: dict = Field(..., description="/api/review 返回的 result 对象")
+
+
+def _set_run_font(run, name="微软雅黑", size=12, bold=False, color=None):
+    run.font.name = name
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), name)
+    if color:
+        run.font.color.rgb = _to_rgb(color)
+
+
+def _add_para(doc, text, size=12, bold=False, color=None, align=None):
+    p = doc.add_paragraph()
+    _set_run_font(p.add_run(text), size=size, bold=bold, color=color)
+    if align is not None:
+        p.alignment = align
+    return p
+
+
+def _add_table(doc, header, rows, widths=None):
+    t = doc.add_table(rows=1, cols=len(header))
+    t.style = "Table Grid"
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, h in enumerate(header):
+        cell = t.rows[0].cells[i]
+        cell.text = ""
+        _set_run_font(cell.paragraphs[0].add_run(h), size=10.5, bold=True)
+    for row in rows:
+        cells = t.add_row().cells
+        for i, val in enumerate(row):
+            cells[i].text = ""
+            _set_run_font(cells[i].paragraphs[0].add_run(str(val)), size=10.5)
+    if widths:
+        for i, w in enumerate(widths):
+            for row in t.rows:
+                row.cells[i].width = Cm(w)
+    return t
+
+
+def build_report_docx(title, track_name, material, r) -> bytes:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    doc = Document()
+
+    # 默认正文样式
+    normal = doc.styles["Normal"]
+    normal.font.name = "微软雅黑"
+    normal.font.size = Pt(12)
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # ── 封面信息页 ──
+    _add_para(doc, "", size=12)
+    _add_para(doc, "创新竞赛评审报告", size=26, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _add_para(doc, "明鉴 · 创新竞赛评审专家", size=14, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _add_para(doc, "", size=12)
+    _add_para(doc, f"作品名称：{title}", size=13)
+    _add_para(doc, f"评审模式：官方竞赛规则（模式 A）", size=13)
+    _add_para(doc, f"赛道：{track_name or '—'}", size=13)
+    _add_para(doc, f"材料类型：{'PPT' if material == 'ppt' else 'BP（商业计划书）'}", size=13)
+    _add_para(doc, f"总分：{r.get('total', '—')} / 100（得分率 {r.get('total', 0)}%）", size=13)
+    _add_para(doc, f"档位：{r.get('level', '—')}（{r.get('level_range', '—')}）", size=13)
+    if r.get("work_score") is not None:
+        _add_para(doc, f"作品水平分：{r['work_score']} / 100（双轨评分）", size=13)
+    _add_para(doc, f"评审日期：{date.today().isoformat()}", size=13)
+    _add_para(doc, "报告版本：V1.0", size=13)
+    doc.add_page_break()
+
+    # ── 执行摘要 ──
+    doc.add_heading("执行摘要", level=1)
+    _add_para(doc, f"总体结论：{r.get('summary', '—')}", size=12, bold=True)
+    if r.get("max_leverage"):
+        _add_para(doc, f"最大改造杠杆：{r['max_leverage']}", size=12)
+
+    # ── 一、评分总览 ──
+    doc.add_heading("一、评分总览", level=1)
+    rows = [[d.get("name", ""), d.get("full", ""), d.get("score", ""), d.get("diagnosis", "")] for d in r.get("dims", [])]
+    rows.append(["总分", "100", r.get("total", ""), f"{r.get('level', '')}（{r.get('level_range', '')}）"])
+    _add_table(doc, ["维度", "满分", "得分", "一句话诊断"], rows, widths=[3.2, 1.8, 1.8, 10.2])
+
+    # ── 二、分项评分 ──
+    doc.add_heading("二、分项评分（逐维度）", level=1)
+    for d in r.get("dims", []):
+        doc.add_heading(f"{d.get('name', '')}（{d.get('score', '—')} / {d.get('full', '—')} 分）", level=2)
+        if d.get("diagnosis"):
+            _add_para(doc, f"关键判断：{d['diagnosis']}", size=11)
+        subs = [[s.get("name", ""), f"{s.get('score', '—')} / {s.get('full', '—')}", s.get("loss", "")] for s in d.get("subdims", [])]
+        if subs:
+            _add_table(doc, ["子维度", "得分", "关键失分点"], subs, widths=[4.0, 2.5, 10.5])
+
+    # ── 三、核心亮点 ──
+    doc.add_heading("三、核心亮点", level=1)
+    for i, h in enumerate(r.get("highlights", []) or ["（无）"], 1):
+        _add_para(doc, f"{i}. {h}", size=12)
+
+    # ── 四、关键不足 ──
+    doc.add_heading("四、关键不足", level=1)
+    for i, w in enumerate(r.get("weaknesses", []) or ["（无）"], 1):
+        _add_para(doc, f"{i}. {w}", size=12)
+
+    # ── 五、改进建议 ──
+    doc.add_heading("五、改进建议（按优先级）", level=1)
+    for s in r.get("suggestions", []):
+        p = doc.add_paragraph()
+        _set_run_font(p.add_run(f"优先级 {s.get('priority', '—')}："), size=12, bold=True)
+        _set_run_font(p.add_run(str(s.get("text", ""))), size=12)
+
+    # ── 六、获奖潜力 ──
+    doc.add_heading("六、获奖潜力判断", level=1)
+    _add_para(doc, str(r.get("potential", "—")), size=12)
+
+    _add_para(doc, "", size=12)
+    _add_para(doc, "本报告由「明鉴」AI 评审引擎自动生成，评分仅供参考，最终以大赛官方评审为准。", size=10, color=0x888888)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+@app.post("/api/export_docx")
+def export_docx(req: ExportRequest):
+    if not HAS_DOCX:
+        raise HTTPException(status_code=500, detail="服务端未安装 python-docx 依赖")
+    try:
+        content = build_report_docx(req.title, req.track, req.material, req.result)
+    except Exception as e:
+        log.error("docx 生成失败: %s", e)
+        raise HTTPException(status_code=500, detail="Word 文档生成失败: " + str(e))
+
+    safe = re.sub(r'[\\/:*?"<>|]', "_", req.title)[:40] or "创新作品"
+    filename = f"{safe}_创新竞赛评审报告_{date.today().strftime('%Y%m%d')}.docx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)},
+    )
 
 
 if __name__ == "__main__":
