@@ -13,6 +13,8 @@ ai-review-backend/
 ├── requirements.txt        # Python 依赖
 ├── .env.example            # 环境变量示例（复制为 .env 并填 Key）
 ├── render.yaml             # Render 云平台一键部署配置
+├── vercel.json             # Vercel 部署配置（免费、无需信用卡）
+├── api/index.py            # Vercel Serverless 入口（导出 asgi_app）
 └── README.md
 ```
 
@@ -77,22 +79,33 @@ curl http://127.0.0.1:8000/api/health
 
 ## 部署方案（三选一）
 
-### 方案 A · Render（免费，推荐，最快）
+### 方案 A · Vercel（免费，无需信用卡，推荐）
+1. 把本目录推送到 GitHub 仓库（已有 `vercel.json` + `api/index.py` 适配）；
+2. 登录 [vercel.com](https://vercel.com)（用 GitHub 账号登录）→ **Add New → Project**；
+3. Import 仓库 `ai-review-backend`，Framework Preset 选 **Other**；
+4. **Environment Variables** 添加 `DEEPSEEK_API_KEY = sk-xxx`；
+5. 点 **Deploy**，约 1-2 分钟完成，得到 `https://ai-review-backend.vercel.app`；
+6. 前端控制台设置 `localStorage.setItem('mj_api_base','https://ai-review-backend.vercel.app')`。
+
+> 注意：Vercel Hobby（免费）计划函数最长执行 60 秒，单次评审一般 30-50 秒，可正常使用；
+> 若提示超时，重试一次即可。
+
+### 方案 B · Render（免费，但需要绑定国际信用卡验证，不扣费）
 1. 把本目录推送到 GitHub 仓库；
-2. 登录 [render.com](https://render.com) → New → Web Service → 选择该仓库；
+2. 登录 [render.com](https://render.com) → New → Blueprint / Web Service → 选择该仓库；
 3. Runtime 选 **Python**，构建命令 `pip install -r requirements.txt`，启动命令
-   `uvicorn app:app --host 0.0.0.0 --port $PORT`；
+   `uvicorn app:app --host 0.0.0.0 --port $PORT`（或直接用已有的 `render.yaml`）；
 4. 添加环境变量 `DEEPSEEK_API_KEY = sk-xxx`；
 5. 部署完成后得到 `https://xxx.onrender.com`，前端控制台设置 `mj_api_base` 指向它。
-   （国内访问 Render 可能较慢，介意可用方案 B/C）
+   （国内访问 Render 可能较慢，介意可用方案 A/C）
 
-### 方案 B · 国内云函数（腾讯云 CloudBase / 阿里云函数计算）
+### 方案 C · 国内云函数（腾讯云 CloudBase / 阿里云函数计算）
 - 打包本目录为 zip，在云函数控制台创建 Python 3 函数；
 - 入口 `app.app`（FastAPI 挂载到 `api.main` 适配云函数网关）；
 - 环境变量填 `DEEPSEEK_API_KEY`；
 - 云函数有免费额度，且国内访问快。
 
-### 方案 C · 自己的服务器 / 校园服务器
+### 方案 D · 自己的服务器 / 校园服务器
 ```bash
 pip install -r requirements.txt
 nohup uvicorn app:app --host 0.0.0.0 --port 8000 &
