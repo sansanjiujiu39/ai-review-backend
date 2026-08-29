@@ -117,7 +117,7 @@ SYSTEM_PROMPT = """你是「明鉴」，一位深耕创新领域二十年的资�
     {
       "name": "个人成长", "full": 25, "score": 20.0, "rate": 80,
       "diagnosis": "一句话诊断（含证据）",
-      "subdims": [{"name":"立德树人","full":4,"score":3.5,"loss":"失分点一句话"}]
+      "subdims": [{"name":"立德树人","full":4,"score":3.5,"gain":"得分点：材料中的证据（章节/数据/证书）","loss":"扣分点：缺什么/扣在哪"}]
     }
   ],
   "highlights": ["三大亮点之一，具体到数据/证书/章节", "…", "…"],
@@ -129,6 +129,7 @@ SYSTEM_PROMPT = """你是「明鉴」，一位深耕创新领域二十年的资�
 【评分要求】
 - 逐维度、逐子维度打分，每项得分必须能从规则层级 + 作品证据中找到依据。
 - 子维度得分之和应等于该维度得分；各维度得分之和等于 total。
+- **每个子维度必须同时给出「得分点 gain」（材料中支持该得分的证据，如章节/页码/数据/证书）与「扣分点 loss」（缺什么/扣在哪）**；无失分项 loss 写"无"；材料未呈现的证据不得编造写入 gain。
 - **total 必须落在 level 对应档位的 level_range 区间内**（如档位=省金则 total ∈ [64,68]）；若按证据计算的总分与档位区间有出入，以档位为准微调 total 并同步调整相关维度得分，保证三者自洽。
 - 若材料信息不足，在 diagnosis / weaknesses 中明确列出缺失项，不得臆测补足证据。
 - 批评必须附改进路径，杜绝空泛的"需加强"式表述。"""
@@ -252,7 +253,7 @@ async def review(req: ReviewRequest):
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.2,
-        "max_tokens": 2500,
+        "max_tokens": 4000,
         "response_format": {"type": "json_object"},
         "stream": False,
     }
@@ -385,15 +386,18 @@ def build_report_docx(title, track_name, material, r) -> bytes:
     rows.append(["总分", "100", r.get("total", ""), f"{r.get('level', '')}（{r.get('level_range', '')}）"])
     _add_table(doc, ["维度", "满分", "得分", "一句话诊断"], rows, widths=[3.2, 1.8, 1.8, 10.2])
 
-    # ── 二、分项评分 ──
-    doc.add_heading("二、分项评分（逐维度）", level=1)
+    # ── 二、评分明细表（逐小项：得分点/扣分点） ──
+    doc.add_heading("二、评分明细表（逐小项）", level=1)
     for d in r.get("dims", []):
         doc.add_heading(f"{d.get('name', '')}（{d.get('score', '—')} / {d.get('full', '—')} 分）", level=2)
         if d.get("diagnosis"):
-            _add_para(doc, f"关键判断：{d['diagnosis']}", size=11)
-        subs = [[s.get("name", ""), f"{s.get('score', '—')} / {s.get('full', '—')}", s.get("loss", "")] for s in d.get("subdims", [])]
+            _add_para(doc, f"维度小结：{d['diagnosis']}", size=11)
+        subs = [
+            [s.get("name", ""), s.get("full", "—"), s.get("score", "—"), s.get("gain", "—"), s.get("loss", "无")]
+            for s in d.get("subdims", [])
+        ]
         if subs:
-            _add_table(doc, ["子维度", "得分", "关键失分点"], subs, widths=[4.0, 2.5, 10.5])
+            _add_table(doc, ["小项", "满分", "得分", "得分点（证据）", "扣分点"], subs, widths=[2.6, 1.4, 1.4, 6.3, 5.3])
 
     # ── 三、核心亮点 ──
     doc.add_heading("三、核心亮点", level=1)
