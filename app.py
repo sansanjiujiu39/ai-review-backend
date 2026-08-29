@@ -1,0 +1,286 @@
+# -*- coding: utf-8 -*-
+"""
+明鉴 · 创新竞赛评审打分 API（v1.8.0 引擎）
+==========================================
+把「明鉴」评审专家（innovation-review-expert v1.8.0）封装为 HTTP 打分服务：
+
+    POST /api/review   上传赛道 + 计划书文本 → 返回结构化评分 JSON
+    GET  /api/tracks   赛道列表（前端下拉框）
+    GET  /api/health   健康检查
+
+DeepSeek API Key 只存在于本服务环境变量中，绝不进入前端代码。
+部署见同目录 README.md。
+"""
+
+import os
+import re
+import json
+import logging
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# ─────────────────────────── 配置 ───────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, "reviewer_data.json")
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions").strip()
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "55000"))   # 中文字符预算（DeepSeek 64K 上下文保守值）
+TIMEOUT = float(os.environ.get("API_TIMEOUT", "120"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("mingjian")
+
+# 10 个赛道 key，顺序与前端 TRACK_KEYS 一致
+TRACK_KEYS = [
+    "gaojiao_chuangyi", "gaojiao_chuangye", "honglv_gongyi", "honglv_chuangyi",
+    "honglv_chuangye", "zhijiao_chuangyi", "zhijiao_chuangye",
+    "chanye_qimingti", "chanye_chengguo", "mengya",
+]
+
+# ─────────────────────────── 数据加载 ───────────────────────────
+with open(DATA_PATH, encoding="utf-8") as f:
+    REVIEWER_DATA = json.load(f)
+
+# ─────────────────── 明鉴 v1.8.0 系统提示词（V3.1 五步打分法） ───────────────────
+SYSTEM_PROMPT = """你是「明鉴」，一位深耕创新领域二十年的资深评审专家，长期担任各类创新竞赛评审委员，阅遍成千上万份创新作品。你已内化《中国国际大学生创新竞赛》全部官方评审规则（10 个赛道/组别），并拥有 155+ 个真实获奖案例（2019-2025，国金/国银/国铜/省奖全档位）校准出的实证锚点库。
+
+【本次任务】用户会给你一份商业计划书文本，以及指定赛道的官方评分规则（含维度、权重、逐级评分标准）和该赛道的获奖案例锚点库。你严格按这些材料评审，输出结构化 JSON 评分结果。
+
+【评审方法论 · V3.1 五步打分法（条例定刻度，案例定分寸）】
+① 案例定分寸（强制先行，最高纪律）：评分前必须先精读 user prompt 中的【实证校准 · 档位定位器与临界规律】与【获奖案例锚点库】——"这个档位的证据长什么样"（三件套/四件套达标到什么程度算国金、国银、国铜），按档位快速定位器五条线（公司状态/验证层级/落地金额/营收呈现/量化指标）先定位，再逐维度打分。条例定刻度 × 案例定分寸缺一不可，禁止只按规则刻度硬套（实证教训：e-spider 首评未查画像偏严 9.5 分，实际国银）。
+② 核心链定档：核心证据链达标情况直接定档位。创意组"三件套"（天花板证据/权威验证/真实落地）、创业组"经营四件套"（公司/到账营收/融资/实名客户）、红旅"公益五维"。核心链达标即进档位基线，不再因单项短板逐项扣分——金奖不可能条条规则满足。
+③ 强项定位：核心强项（验证硬度/专家层级/落地金额/团队稀缺度）达"突出标准"→ 档内上移/加分溢出。
+④ 短板豁免/致命降档：短板命中"允许短板清单"不扣分（创意组：无营收/无订单、未注册公司、专利少或零、育人叙事弱、附件缺失；创业组：营收百万级/未盈利、融资仅天使轮、育人叙事弱、专利归校、非顶尖高校、客户未实名但有具名表述；红旅公益：无经营实绩、覆盖面小但有深度案例）；只有命中"致命短板清单"才降档（纯概念无验证/无样机、四件套缺两件以上、材料自相矛盾致可信度崩溃、技术路线无原创性证据、团队与项目完全脱节）。
+⑤ 材料完整度小扣（独立于内容分）：缺核心章节扣 1-3 分；正文乱码/数据矛盾扣 0.5-1 分；流传渠道特性（水印/纯图片可 OCR/附件缺失）不扣分。
+【执行纪律（四必须）】
+1. 评分前必查实证校准段与锚点画像（先"定分寸"再"定刻度"细节）；
+2. 档位是竞争性结果，不可机械判档——存在"强数据落低档"（神州VR 营收 2400 万+订单 6000 万仍国铜、授虾以蚕 1.5 亿营业额仍国银），赛道天花板、材料可信度是隐性因素，须核查后说明；
+3. 每条失分必须配可落地的改进建议（具体到章节/页面：改哪里、怎么改、改完能提升多少），禁止只判档不给方；
+4. 评分尺度放宽（V2.6 实证沉淀）：附件原件缺失降为提示项不扣分（表述具体+数字明确+机构具名即按已呈现证据计分）；纯图片 OCR 可完整提取不扣分；水印不扣分；预测性财务无测算不扣分（仅提示）；子项未提及按满分 10-15% 给基线分；档间取值取证据上限。禁止反向贴分（材料中不存在的证据不得凭空加分）。
+
+【三档分界速记】国铜=无实物/纯计划/验证无动作；国银=实物+试用+意向/协议动作齐全（未授权/无到账/无金额不降档）；国金=授权/查新/到账顶格；省金=晋级标签按材料质量独立打分（达国奖水平给国奖区间，不因标签压分）。
+
+【八大铁律 · 必须遵守】
+1. 硬证据 > 叙事："世界首创/领航者/纪录"等标题不计分；注册证/审定证书/检测报告/到账营收/合同/获奖才计分。
+2. 证据错位识别：论文/专利/学术实验是"学术证据"，撑底线分不撑项目分；项目级验证 = 产品原型/临床/试用/检测/订单/合同。
+3. 只认"到账营收"，不认"预计/订单/科研经费"；以"户/家/单位"计比"人次"更有说服力。
+4. 态度分陷阱：选题方向、财务克制、学校平台不构成加分。
+5. 赛制层级：省金=省级一等奖+国赛入围资格，与国奖是晋级关系而非并列档位，按材料质量打分不因标签压分。
+6. 格式合规酌情扣分：缺件/缺页/水印残留/纯图片无文字/排版混乱/封面信息缺失，在材料呈现维度酌情扣分（不构成降档，累计不超该维度满分 20-30%；缺核心章节致证据无法核验时可影响档位）。
+7. 阶段适配豁免：仅长周期硬科技早期项目（芯片/新药等）在满足"天花板团队+架构级创新+战略窗口"时可豁免当期经营实绩，消费级/软件/服务类一律不豁免。
+8. 严格区分赛道：不同赛道维度权重不同，必须用当前指定赛道的规则，禁止混用。
+
+【七档标尺 V3.1（实证版）】
+国金 85-100（三件套/四件套齐备且顶格：查新首创/顶会/院士源头 + 国家级验证 + 大额到账订单 + 实名客户）/ 国银 76-85（证据链完整，缺"行业第一"级证据）/ 国铜 68-76（拟成立/未注册公司、验证无动作、计划无数额）/ 省金 64-68（晋级标签非档次标签：按材料质量独立打分，质量上限可至国金）/ 省银 58-64（有公司/标准/产业依托，但项目自身硬证据不足）/ 省铜 52-58（未注册公司/小体量/预测收入）/ 未获奖 35-52（零验证/纯方案/凑分书，低于 52 一律不算获奖）。
+
+【双轨评分】total 为材料分（评审对象=所提交材料，按实际呈现证据打分）。可额外给出 work_score 作品水平分（评审对象=作品，依据可见证据上限+锚点实证记录推演），并在 summary 或 potential 中说明两分差 = 材料版本落差 + 答辩补充；作品水平分禁止"因国金标签贴分"。
+
+【材料类型】默认按 BP（商业计划书）口径评审。用户提供的是纯文本（可能因 OCR 或粘贴丢失排版），不因文本格式简陋而惩罚内容，但可指出"证据无法核验"的缺失项。
+
+【输出要求 · 严格 JSON】
+只输出一个合法 JSON 对象，不要输出任何解释、markdown 代码块标记、或 JSON 之外的文字。字段 schema 如下：
+{
+  "total": 数字,               // 总分（材料分），保留1位小数
+  "work_score": 数字,          // 可选：作品水平分（保留1位小数）
+  "level": 字符串,             // 档位名：国金/国银/国铜/省金/省银/省铜/未获奖
+  "level_range": 字符串,       // 如 "68-76"
+  "summary": 字符串,           // 一句话定调（犀利、有记忆点）
+  "max_leverage": 字符串,      // 最大改造杠杆（最高性价比改进方向）
+  "dims": [                    // 每个一级维度一条
+    {
+      "name": "个人成长", "full": 25, "score": 20.0, "rate": 80,
+      "diagnosis": "一句话诊断（含证据）",
+      "subdims": [{"name":"立德树人","full":4,"score":3.5,"loss":"失分点一句话"}]
+    }
+  ],
+  "highlights": ["三大亮点之一，具体到数据/证书/章节", "…", "…"],
+  "weaknesses": ["三大不足之一，说明约失多少分、涉及哪些维度", "…", "…"],
+  "suggestions": [{"priority":1,"text":"最高优先级改进建议，具体到章节/页面可落地"}, {"priority":2,"text":"…"}],
+  "potential": "获奖潜力判断：当前定位 + 改造后潜力"
+}
+
+【评分要求】
+- 逐维度、逐子维度打分，每项得分必须能从规则层级 + 作品证据中找到依据。
+- 子维度得分之和应等于该维度得分；各维度得分之和等于 total。
+- **total 必须落在 level 对应档位的 level_range 区间内**（如档位=省金则 total ∈ [64,68]）；若按证据计算的总分与档位区间有出入，以档位为准微调 total 并同步调整相关维度得分，保证三者自洽。
+- 若材料信息不足，在 diagnosis / weaknesses 中明确列出缺失项，不得臆测补足证据。
+- 批评必须附改进路径，杜绝空泛的"需加强"式表述。"""
+
+
+# ─────────────────────────── prompt 组装（移植前端 buildAiPrompt） ───────────────────────────
+def build_prompt(track_key: str, text: str) -> str:
+    track = REVIEWER_DATA["tracks"].get(track_key)
+    if not track:
+        raise HTTPException(status_code=400, detail=f"未知赛道: {track_key}")
+
+    global_data = REVIEWER_DATA.get("global", {})
+    sys_len = len(SYSTEM_PROMPT)
+    manual = global_data.get("manual_v31", "")       # 实证校准：档位定位器+临界规律+放宽规则
+    index = global_data.get("anchor_index", "")
+    bprules = global_data.get("bp_ppt_rules", "")
+    fixed_len = sys_len + len(manual) + len(index) + len(bprules) + 1000  # 分隔/标题余量
+
+    budget = MAX_INPUT_CHARS - fixed_len
+
+    # 1) 官方评分规则：优先完整保留（打分依据）
+    rule = track.get("rule", "")
+    budget -= len(rule)
+    if budget < 6000:
+        rule = rule[: max(6000, budget + len(rule))]
+        budget = max(0, budget)
+
+    # 2) 锚点库：截取前部（国金档在前），至少保留 6000 字
+    anchors = track.get("anchors", "")
+    a_max = min(len(anchors), max(6000, int(budget * 0.55)))
+    anchors = anchors[:a_max]
+    budget -= a_max
+
+    # 3) 计划书正文：取剩余预算，至少 8000 字
+    body = text[: max(8000, budget)]
+
+    return "\n".join([
+        "【指定赛道】" + track.get("name", track_key),
+        "",
+        "【官方评分规则（条例定刻度）】",
+        rule,
+        "",
+        "【实证校准 · 档位定位器与临界规律（评分前必读，案例定分寸）】",
+        manual,
+        "",
+        "【获奖案例锚点库（案例参照）】",
+        anchors,
+        "",
+        "【七档标尺与通用通则】",
+        index,
+        "",
+        "【材料呈现规则】",
+        bprules,
+        "",
+        "【待评审的商业计划书正文】",
+        body,
+        "",
+        "请严格按上述规则与锚点库评审，只输出一个合法 JSON 对象，不要输出任何其他文字。",
+    ])
+
+
+def extract_json(raw: str):
+    s = str(raw).strip()
+    s = re.sub(r"^```json\s*", "", s, flags=re.I)
+    s = re.sub(r"^```\s*", "", s)
+    s = re.sub(r"```\s*$", "", s)
+    a, b = s.find("{"), s.rfind("}")
+    if a >= 0 and b > a:
+        s = s[a : b + 1]
+    return json.loads(s)
+
+
+# ─────────────────────────── FastAPI 应用 ───────────────────────────
+app = FastAPI(title="明鉴 · AI 评审打分 API", version="1.8.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],           # 部署后建议收紧为你的前端域名
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ReviewRequest(BaseModel):
+    track: str = Field(..., description="赛道 key，如 gaojiao_chuangyi")
+    text: str = Field(..., min_length=50, description="从计划书提取的正文（至少 50 字）")
+    material: str = Field("bp", description="bp | ppt")
+
+
+@app.get("/api/health")
+def health():
+    ok = bool(DEEPSEEK_API_KEY)
+    return {"status": "ok", "engine": "mingjian-v1.8.0", "deepseek_key_configured": ok}
+
+
+@app.get("/api/tracks")
+def tracks():
+    return {"tracks": [{"key": k, "name": REVIEWER_DATA["tracks"][k]["name"]} for k in TRACK_KEYS]}
+
+
+@app.post("/api/review")
+async def review(req: ReviewRequest):
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(status_code=500, detail="服务端未配置 DEEPSEEK_API_KEY 环境变量")
+
+    if req.track not in REVIEWER_DATA["tracks"]:
+        raise HTTPException(status_code=400, detail=f"未知赛道: {req.track}")
+
+    text = req.text.strip()
+    if len(text) < 50:
+        raise HTTPException(status_code=400, detail="计划书内容不足：请上传 PDF / Word 文件提取文字（至少 50 字）")
+
+    user_prompt = build_prompt(req.track, text)
+    log.info("评审请求: track=%s material=%s 正文长度=%d prompt长度=%d",
+             req.track, req.material, len(text), len(user_prompt))
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 2500,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.post(
+                DEEPSEEK_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + DEEPSEEK_API_KEY,
+                },
+                json=payload,
+            )
+    except httpx.HTTPError as e:
+        log.error("DeepSeek 请求失败: %s", e)
+        raise HTTPException(status_code=502, detail="上游模型服务请求失败: " + str(e))
+
+    if resp.status_code != 200:
+        log.error("DeepSeek 返回 %s: %s", resp.status_code, resp.text[:300])
+        raise HTTPException(status_code=502, detail=f"上游模型服务返回 HTTP {resp.status_code}")
+
+    data = resp.json()
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    if not content:
+        raise HTTPException(status_code=502, detail="模型返回内容为空")
+
+    try:
+        result = extract_json(content)
+    except json.JSONDecodeError as e:
+        log.error("JSON 解析失败: %s\n原始内容: %s", e, content[:500])
+        raise HTTPException(status_code=502, detail="模型输出解析失败，请重试")
+
+    # 轻量校验：total 必须是数字
+    if "total" not in result:
+        result["total"] = 0
+    try:
+        result["total"] = round(float(result["total"]), 1)
+    except (TypeError, ValueError):
+        result["total"] = 0
+
+    return {"ok": True, "track": req.track, "material": req.material, "result": result}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -1,0 +1,8 @@
+# 密钥与环境变量 —— 绝不上传！
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
