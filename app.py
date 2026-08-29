@@ -386,18 +386,18 @@ def build_report_docx(title, track_name, material, r) -> bytes:
     rows.append(["总分", "100", r.get("total", ""), f"{r.get('level', '')}（{r.get('level_range', '')}）"])
     _add_table(doc, ["维度", "满分", "得分", "一句话诊断"], rows, widths=[3.2, 1.8, 1.8, 10.2])
 
-    # ── 二、评分明细表（逐小项：得分点/扣分点） ──
-    doc.add_heading("二、评分明细表（逐小项）", level=1)
+    # ── 二、分项评分（逐维度） ──
+    doc.add_heading("二、分项评分（逐维度）", level=1)
     for d in r.get("dims", []):
         doc.add_heading(f"{d.get('name', '')}（{d.get('score', '—')} / {d.get('full', '—')} 分）", level=2)
         if d.get("diagnosis"):
-            _add_para(doc, f"维度小结：{d['diagnosis']}", size=11)
+            _add_para(doc, f"关键判断：{d['diagnosis']}", size=11)
         subs = [
-            [s.get("name", ""), s.get("full", "—"), s.get("score", "—"), s.get("gain", "—"), s.get("loss", "无")]
+            [s.get("name", ""), f"{s.get('score', '—')} / {s.get('full', '—')}", s.get("loss", "无")]
             for s in d.get("subdims", [])
         ]
         if subs:
-            _add_table(doc, ["小项", "满分", "得分", "得分点（证据）", "扣分点"], subs, widths=[2.6, 1.4, 1.4, 6.3, 5.3])
+            _add_table(doc, ["子维度", "得分", "关键失分点"], subs, widths=[4.0, 2.5, 10.5])
 
     # ── 三、核心亮点 ──
     doc.add_heading("三、核心亮点", level=1)
@@ -428,6 +428,72 @@ def build_report_docx(title, track_name, material, r) -> bytes:
     return buf.getvalue()
 
 
+def build_sheet_docx(title, track_name, material, r) -> bytes:
+    """评分明细表（独立文档）：逐小项展示得分点证据与扣分点"""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    doc = Document()
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "微软雅黑"
+    normal.font.size = Pt(12)
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # ── 封面信息页 ──
+    _add_para(doc, "", size=12)
+    _add_para(doc, "评分明细表", size=26, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _add_para(doc, "明鉴 · 创新竞赛评审专家", size=14, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _add_para(doc, "", size=12)
+    _add_para(doc, f"作品名称：{title}", size=13)
+    _add_para(doc, f"赛道：{track_name or '—'}", size=13)
+    _add_para(doc, f"材料类型：{'PPT' if material == 'ppt' else 'BP（商业计划书）'}", size=13)
+    _add_para(doc, f"总分：{r.get('total', '—')} / 100（{r.get('level', '—')}，{r.get('level_range', '—')}）", size=13)
+    if r.get("work_score") is not None:
+        _add_para(doc, f"作品水平分：{r['work_score']} / 100（双轨评分）", size=13)
+    _add_para(doc, f"评审日期：{date.today().isoformat()}", size=13)
+    doc.add_page_break()
+
+    # ── 逐维度明细表（5 列：小项|满分|得分|得分点|扣分点） ──
+    for d in r.get("dims", []):
+        doc.add_heading(f"{d.get('name', '')}（{d.get('score', '—')} / {d.get('full', '—')} 分）", level=1)
+        if d.get("diagnosis"):
+            _add_para(doc, f"维度小结：{d['diagnosis']}", size=11)
+        subs = [
+            [s.get("name", ""), s.get("full", "—"), s.get("score", "—"), s.get("gain", "—"), s.get("loss", "无")]
+            for s in d.get("subdims", [])
+        ]
+        if subs:
+            _add_table(doc, ["小项", "满分", "得分", "得分点（证据）", "扣分点"], subs, widths=[2.6, 1.4, 1.4, 6.3, 5.3])
+
+    # ── 总分汇总表 ──
+    doc.add_heading("总分汇总", level=1)
+    total_rows = [[d.get("name", ""), d.get("full", ""), d.get("score", "")] for d in r.get("dims", [])]
+    total_rows.append(["总分", "100", r.get("total", "")])
+    _add_table(doc, ["维度", "满分", "得分"], total_rows, widths=[4.0, 2.5, 2.5])
+
+    # ── 档位判定 ──
+    doc.add_heading("档位判定", level=1)
+    _add_para(doc, f"当前档位：{r.get('level', '—')}（{r.get('level_range', '—')}）", size=12)
+    if r.get("potential"):
+        _add_para(doc, f"获奖潜力：{r['potential']}", size=12)
+
+    _add_para(doc, "", size=12)
+    _add_para(doc, "本表由「明鉴」AI 评审引擎自动生成，逐小项得分点（证据）与扣分点仅供参考，最终以大赛官方评审为准。", size=10, color=0x888888)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _docx_response(content, title, suffix):
+    safe = re.sub(r'[\\/:*?"<>|]', "_", title)[:40] or "创新作品"
+    filename = f"{safe}_{suffix}_{date.today().strftime('%Y%m%d')}.docx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)},
+    )
+
+
 @app.post("/api/export_docx")
 def export_docx(req: ExportRequest):
     if not HAS_DOCX:
@@ -437,14 +503,20 @@ def export_docx(req: ExportRequest):
     except Exception as e:
         log.error("docx 生成失败: %s", e)
         raise HTTPException(status_code=500, detail="Word 文档生成失败: " + str(e))
+    return _docx_response(content, req.title, "创新竞赛评审报告")
 
-    safe = re.sub(r'[\\/:*?"<>|]', "_", req.title)[:40] or "创新作品"
-    filename = f"{safe}_创新竞赛评审报告_{date.today().strftime('%Y%m%d')}.docx"
-    return Response(
-        content=content,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)},
-    )
+
+@app.post("/api/export_sheet")
+def export_sheet(req: ExportRequest):
+    """评分明细表（独立文档）"""
+    if not HAS_DOCX:
+        raise HTTPException(status_code=500, detail="服务端未安装 python-docx 依赖")
+    try:
+        content = build_sheet_docx(req.title, req.track, req.material, req.result)
+    except Exception as e:
+        log.error("评分明细表生成失败: %s", e)
+        raise HTTPException(status_code=500, detail="评分明细表生成失败: " + str(e))
+    return _docx_response(content, req.title, "评分明细表")
 
 
 if __name__ == "__main__":
