@@ -131,7 +131,7 @@ Key 已泄露。请立即：
 
 ## 开源说明
 
-本项目以 **MIT License** 开源，版权所有：© 2026 Huang Rende and Ma Hanyu。
+本项目以 **MIT License** 开源，版权所有：© 2026 Huang Rende。
 允许商用、修改与分发，使用/修改后保留版权声明即可。
 
 - **在线演示前端**：<https://sansanjiujiu39.github.io/guochuang-score/>
