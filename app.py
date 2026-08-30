@@ -51,7 +51,7 @@ DATA_PATH = os.path.join(BASE_DIR, "reviewer_data.json")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions").strip()
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
-MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "55000"))   # 中文字符预算（DeepSeek 64K 上下文保守值）
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "65000"))   # 中文字符预算（DeepSeek 64K 上下文，中文约0.6-0.7 token/字，留出输出余量）
 TIMEOUT = float(os.environ.get("API_TIMEOUT", "120"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -163,10 +163,26 @@ def build_prompt(track_key: str, text: str) -> str:
     anchors = anchors[:a_max]
     budget -= a_max
 
-    # 3) 计划书正文：取剩余预算，至少 8000 字
-    body = text[: max(8000, budget)]
+    # 3) 计划书正文：保头保尾智能截断（财务/团队/落地计划通常在文档尾部，不能丢）
+    body_limit = max(8000, budget)
+    truncated = False
+    if len(text) > body_limit:
+        truncated = True
+        head = int(body_limit * 0.62)
+        tail = body_limit - head - 60
+        if tail < 1200:
+            head = body_limit - 1200
+            tail = 1200
+        cut_n = len(text) - (head + tail)
+        body = (
+            text[:head]
+            + f"\n\n……（原文共 {len(text)} 字，因长度限制省略中间约 {cut_n} 字，以下为文末部分，请一并评审）……\n\n"
+            + text[-tail:]
+        )
+    else:
+        body = text
 
-    return "\n".join([
+    prompt = "\n".join([
         "【指定赛道】" + track.get("name", track_key),
         "",
         "【官方评分规则（条例定刻度）】",
@@ -189,6 +205,7 @@ def build_prompt(track_key: str, text: str) -> str:
         "",
         "请严格按上述规则与锚点库评审，只输出一个合法 JSON 对象，不要输出任何其他文字。",
     ])
+    return prompt, {"truncated": truncated, "input_chars": len(text), "used_chars": len(body)}
 
 
 def extract_json(raw: str):
@@ -242,9 +259,9 @@ async def review(req: ReviewRequest):
     if len(text) < 50:
         raise HTTPException(status_code=400, detail="计划书内容不足：请上传 PDF / Word 文件提取文字（至少 50 字）")
 
-    user_prompt = build_prompt(req.track, text)
-    log.info("评审请求: track=%s material=%s 正文长度=%d prompt长度=%d",
-             req.track, req.material, len(text), len(user_prompt))
+    user_prompt, trunc_info = build_prompt(req.track, text)
+    log.info("评审请求: track=%s material=%s 正文长度=%d prompt长度=%d 截断=%s",
+             req.track, req.material, len(text), len(user_prompt), trunc_info["truncated"])
 
     payload = {
         "model": DEEPSEEK_MODEL,
@@ -299,7 +316,15 @@ async def review(req: ReviewRequest):
     except (TypeError, ValueError):
         result["total"] = 0
 
-    return {"ok": True, "track": req.track, "material": req.material, "result": result}
+    return {
+        "ok": True,
+        "track": req.track,
+        "material": req.material,
+        "truncated": trunc_info["truncated"],
+        "input_chars": trunc_info["input_chars"],
+        "used_chars": trunc_info["used_chars"],
+        "result": result,
+    }
 
 
 # ─────────────────────────── Word 报告导出（明鉴专业商业报告格式） ───────────────────────────
