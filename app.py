@@ -51,7 +51,7 @@ DATA_PATH = os.path.join(BASE_DIR, "reviewer_data.json")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions").strip()
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
-MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "65000"))   # 中文字符预算（DeepSeek 64K 上下文，中文约0.6-0.7 token/字，留出输出余量）
+MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "95000"))   # 中文字符预算（DeepSeek 64K 上下文：中文约0.6 token/字，9.5万字符≈5.7万 token + 输出4K ≈ 6.1万，实测安全）
 TIMEOUT = float(os.environ.get("API_TIMEOUT", "120"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -157,9 +157,9 @@ def build_prompt(track_key: str, text: str) -> str:
         rule = rule[: max(6000, budget + len(rule))]
         budget = max(0, budget)
 
-    # 2) 锚点库：截取前部（国金档在前），至少保留 6000 字
+    # 2) 锚点库：截取前部（国金档在前），至少保留 6000 字；正文优先（锚点取预算 42%，全量优先）
     anchors = track.get("anchors", "")
-    a_max = min(len(anchors), max(6000, int(budget * 0.55)))
+    a_max = min(len(anchors), max(6000, int(budget * 0.42)))
     anchors = anchors[:a_max]
     budget -= a_max
 
