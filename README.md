@@ -1,5 +1,7 @@
 # 明鉴 · AI 评审打分后端（v1.8.0）
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 把「明鉴」创新竞赛评审专家封装为 HTTP API 服务。前端（国创赛自评网站）上传计划书文本，
 后端按明鉴 V3.1 五步打分法 + 官方赛道规则 + 155+ 实证锚点库组装评审指令，调用 DeepSeek 打分，
 返回结构化评分 JSON。**DeepSeek API Key 只存在后端环境变量中，不会出现在前端代码里。**
@@ -15,6 +17,7 @@ ai-review-backend/
 ├── render.yaml             # Render 云平台一键部署配置
 ├── vercel.json             # Vercel 部署配置（免费、无需信用卡）
 ├── api/index.py            # Vercel Serverless 入口（导出 asgi_app）
+├── LICENSE                  # MIT 开源许可证
 └── README.md
 ```
 
@@ -125,3 +128,12 @@ Key 已泄露。请立即：
 
 - 打分逻辑升级时，只需更新 `app.py` 中的 `SYSTEM_PROMPT`（明鉴方法论）与 `reviewer_data.json`（规则/锚点库），前端无需改动。
 - `reviewer_data.json` 由网站原内嵌数据提取，规则源与专家包 `references/competition-rules/` 一致。
+
+## 开源说明
+
+本项目以 **MIT License** 开源，版权所有：© 2026 Huang Rende and Ma Hanyu。
+允许商用、修改与分发，使用/修改后保留版权声明即可。
+
+- **在线演示前端**：<https://sansanjiujiu39.github.io/guochuang-score/>
+- **前端仓库**：<https://github.com/sansanjiujiu39/guochuang-score>
+- **打分引擎**：DeepSeek API（调用方自行配置 `DEEPSEEK_API_KEY`，本仓库不含任何真实密钥）
