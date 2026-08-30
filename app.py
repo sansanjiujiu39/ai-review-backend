@@ -16,6 +16,7 @@ import os
 import re
 import io
 import json
+import asyncio
 import logging
 from datetime import date
 from urllib.parse import quote
@@ -136,6 +137,98 @@ SYSTEM_PROMPT = """你是「明鉴」，一位深耕创新领域二十年的资�
 
 
 # ─────────────────────────── prompt 组装（移植前端 buildAiPrompt） ───────────────────────────
+
+# 超长文档分段评审：每段长度与信息提取提示词
+SEGMENT_CHARS = 15000  # 每段约 1.5 万字符（单段可完整阅读）
+EXTRACT_PROMPT = """你是商业计划书信息提取器。请阅读下方计划书片段，提取其中实际出现的信息，只输出一个 JSON 对象，字段如下：
+{"项目名称":"", "项目背景与痛点":"", "产品与服务":"", "技术创新与壁垒":"", "市场分析":"", "商业模式与收入":"", "财务与融资":"", "团队与落地证据":"", "其他关键信息":""}
+要求：1) 只提取该片段中真实出现的内容，保留具体数据（金额/数量/日期/百分比）；2) 某字段片段中未提及则写"未提及"；3) 不要总结观点，忠实摘录事实。"""
+
+
+def body_budget_for(track_key: str) -> int:
+    """计算某赛道留给计划书正文的字符预算"""
+    track = REVIEWER_DATA["tracks"].get(track_key) or {}
+    global_data = REVIEWER_DATA.get("global", {})
+    fixed_len = (
+        len(SYSTEM_PROMPT)
+        + len(global_data.get("manual_v31", ""))
+        + len(global_data.get("anchor_index", ""))
+        + len(global_data.get("bp_ppt_rules", ""))
+        + 1000
+    )
+    budget = MAX_INPUT_CHARS - fixed_len - len(track.get("rule", ""))
+    a_max = min(len(track.get("anchors", "")), max(6000, int(budget * 0.42)))
+    return max(8000, budget - a_max)
+
+
+async def _llm_once(client: httpx.AsyncClient, messages: list, max_tokens: int = 800):
+    """调用 DeepSeek 并返回文本内容"""
+    resp = await client.post(
+        DEEPSEEK_URL,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + DEEPSEEK_API_KEY,
+        },
+        json={
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "stream": False,
+        },
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"上游模型返回 HTTP {resp.status_code}")
+    content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    if not content:
+        raise HTTPException(status_code=502, detail="模型返回内容为空")
+    return content
+
+
+async def _extract_segment(client: httpx.AsyncClient, seg: str):
+    """提取单个片段的要点 JSON"""
+    try:
+        content = await _llm_once(
+            client,
+            [
+                {"role": "system", "content": EXTRACT_PROMPT},
+                {"role": "user", "content": seg},
+            ],
+            max_tokens=1000,
+        )
+        return extract_json(content)
+    except Exception:
+        return {}  # 单段失败不阻塞整体，缺失信息在要点包中留空
+
+
+async def segment_review_text(text: str):
+    """超长文档：切段→并发提取→汇总要点包。返回 (要点包文本, 段数)"""
+    chunks = [text[i : i + SEGMENT_CHARS] for i in range(0, len(text), SEGMENT_CHARS)]
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        results = await asyncio.gather(*[_extract_segment(client, c) for c in chunks])
+
+    merged: dict = {}
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        for k, v in r.items():
+            if isinstance(v, str) and v and v != "未提及":
+                merged[k] = (merged.get(k, "") + "；" + v).strip("；")
+    merged = {k: v for k, v in merged.items() if v}
+
+    if not merged:
+        # 全段提取失败，退化为保头保尾原文
+        return text, len(chunks)
+
+    lines = [f"【{k}】{v}" for k, v in merged.items()]
+    summary = (
+        "以下为超长计划书的分段提取要点（原文共 %d 段，已逐段精读并汇总），"
+        "请基于全部要点做完整评审，注意信息完整性：\n\n" % len(chunks)
+    ) + "\n".join(lines)
+    return summary, len(chunks)
+
+
 def build_prompt(track_key: str, text: str) -> str:
     track = REVIEWER_DATA["tracks"].get(track_key)
     if not track:
@@ -259,9 +352,17 @@ async def review(req: ReviewRequest):
     if len(text) < 50:
         raise HTTPException(status_code=400, detail="计划书内容不足：请上传 PDF / Word 文件提取文字（至少 50 字）")
 
+    # 超长文档（超过该赛道正文预算且 > 2.5 万字）→ 分段提取 + 多轮评审
+    segmented = False
+    segments = 1
+    if len(text) > body_budget_for(req.track) and len(text) > 25000:
+        log.info("超长文档，进入分段评审: 长度=%d", len(text))
+        text, segments = await segment_review_text(text)
+        segmented = True
+
     user_prompt, trunc_info = build_prompt(req.track, text)
-    log.info("评审请求: track=%s material=%s 正文长度=%d prompt长度=%d 截断=%s",
-             req.track, req.material, len(text), len(user_prompt), trunc_info["truncated"])
+    log.info("评审请求: track=%s material=%s 正文长度=%d prompt长度=%d 截断=%s 分段=%s(%d段)",
+             req.track, req.material, len(text), len(user_prompt), trunc_info["truncated"], segmented, segments)
 
     payload = {
         "model": DEEPSEEK_MODEL,
@@ -323,6 +424,8 @@ async def review(req: ReviewRequest):
         "truncated": trunc_info["truncated"],
         "input_chars": trunc_info["input_chars"],
         "used_chars": trunc_info["used_chars"],
+        "segmented": segmented,
+        "segments": segments,
         "result": result,
     }
 
